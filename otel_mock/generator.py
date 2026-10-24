@@ -190,7 +190,7 @@ class TelemetryGenerator:
         """Emit exactly one span for ``service`` (and recurse into its own
         declared dependencies), with every modifier looked up by the
         *current* service name so nothing is diluted by recursion depth."""
-        span_id = uuid.uuid4().hex[:16]
+        span_id = f"{self._rng.getrandbits(64):016x}"
         latency_multiplier = latency_multiplier_by_service.get(service, 1.0)
         error_boost = error_boost_by_service.get(service, 0.0)
         base_latency = _baseline_latency_ms(service) * latency_multiplier
