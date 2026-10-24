@@ -4,11 +4,10 @@ into a single, dissent-transparent :class:`~evaluator.models.JuryVerdict`.
 
 from __future__ import annotations
 
-from rules.features import EvidenceBundle
-from rules.models import RuleVerdict
-
 from evaluator.judges import DEFAULT_JUDGES, Judge
 from evaluator.models import JudgeVerdict, JuryVerdict
+from rules.features import EvidenceBundle
+from rules.models import RuleVerdict
 
 
 class JuryPanel:

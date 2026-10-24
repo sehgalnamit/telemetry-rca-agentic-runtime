@@ -14,9 +14,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from rules.models import RuleVerdict
-
 from evaluator.models import FinalDecision, JuryVerdict
+from rules.models import RuleVerdict
 
 DEFAULT_AUTO_REMEDIATE_THRESHOLD = 0.8
 DEFAULT_LOW_CONFIDENCE_THRESHOLD = 0.5

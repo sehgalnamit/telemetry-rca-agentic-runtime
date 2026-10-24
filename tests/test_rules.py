@@ -9,7 +9,6 @@ from datetime import timedelta
 import pytest
 
 from rules import RuleEngine, build_evidence_bundle
-
 from tests.helpers import ALL_SCENARIO_KEYS, build_scenario_fixture
 
 

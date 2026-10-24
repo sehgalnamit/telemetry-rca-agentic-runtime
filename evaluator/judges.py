@@ -17,10 +17,9 @@ from __future__ import annotations
 
 import abc
 
+from evaluator.models import JudgeVerdict
 from rules.features import EvidenceBundle
 from rules.models import RuleVerdict
-
-from evaluator.models import JudgeVerdict
 
 
 class Judge(abc.ABC):

@@ -23,13 +23,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 
-from federation.access_control import AccessScope
-from federation.query_layer import FederationQueryEngine
-from otel_mock.models import TenantTopology
-from rules.engine import RuleEngine
-from rules.features import EvidenceBundle, build_evidence_bundle
-from rules.models import RuleVerdict
-
 from agent.hypothesis import generate_hypotheses
 from agent.models import Alert, Hypothesis
 from audit.log_store import AuditLogStore
@@ -37,6 +30,12 @@ from audit.models import AuditEntryType
 from evaluator.decision import combine_decision
 from evaluator.jury import JuryPanel
 from evaluator.models import FinalDecision, JuryVerdict
+from federation.access_control import AccessScope
+from federation.query_layer import FederationQueryEngine
+from otel_mock.models import TenantTopology
+from rules.engine import RuleEngine
+from rules.features import EvidenceBundle, build_evidence_bundle
+from rules.models import RuleVerdict
 
 
 @dataclass

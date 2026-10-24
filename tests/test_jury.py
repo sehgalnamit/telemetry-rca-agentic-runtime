@@ -5,7 +5,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from evaluator import ConservativeSkepticJudge, EvidenceCoverageJudge, JuryPanel, RuleAlignmentJudge, combine_decision
+from evaluator import (
+    ConservativeSkepticJudge,
+    EvidenceCoverageJudge,
+    JuryPanel,
+    RuleAlignmentJudge,
+    combine_decision,
+)
 from evaluator.models import JuryVerdict
 from rules.features import EvidenceBundle
 from rules.models import RuleVerdict

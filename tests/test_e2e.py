@@ -8,7 +8,6 @@ from __future__ import annotations
 import pytest
 
 from audit.models import AuditEntryType
-
 from tests.helpers import ALL_SCENARIO_KEYS, build_scenario_fixture, run_pipeline
 
 
