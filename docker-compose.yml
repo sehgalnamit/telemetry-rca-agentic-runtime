@@ -1,0 +1,14 @@
+# Fully local demo stack. There is deliberately no separate "database"
+# service: each simulated tenant's OTel-like telemetry lives in its own
+# DuckDB file under ./data/tenants (mounted as a volume), and the
+# federation layer attaches those files read-only at query time -- the
+# same zero-copy pattern described in docs/ZERO_COPY_DATA_MODEL.md, just
+# running on one machine instead of across tenant cloud accounts.
+services:
+  rca-runtime:
+    build: .
+    image: telemetry-rca-agentic-runtime:local
+    container_name: telemetry-rca-runtime
+    volumes:
+      - ./data:/app/data
+    command: ["python", "scripts/demo.py", "--all", "--cross-tenant-federation-demo"]
