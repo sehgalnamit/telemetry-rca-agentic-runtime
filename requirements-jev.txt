@@ -1,0 +1,14 @@
+# Optional dependencies for the REAL hosted TypeSafe Jev adapter
+# (evaluator.jev_gate.TypeSafeJevClient). Not required for the offline
+# deterministic stand-in (evaluator.jev_gate.LocalJevStandIn), which is
+# what this repo's tests and CI use.
+#
+# Install with: pip install -r requirements-jev.txt
+# Also requires the TYPESAFE_API_KEY environment variable to be set.
+httpx>=0.27,<1.0
+
+# Official TypeSafe Python SDK (https://docs.typesafe.ai/introduction).
+# Listed here for users who prefer the official SDK's TypeSafeClient over
+# this repo's direct httpx-based REST adapter; not imported by
+# evaluator/jev_gate.py itself.
+typesafe-sdk>=0.1
