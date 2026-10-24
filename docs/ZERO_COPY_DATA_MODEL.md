@@ -114,6 +114,15 @@ count. No telemetry value ever appears in it. This is exactly what the
 audit log (`audit/`) persists for every evidence-gathering step the RCA
 agent takes -- see `tests/test_e2e.py::test_pipeline_audit_trail_never_contains_raw_telemetry_text`.
 
+The same principle extends to the validation gate: when a hypothesis is
+checked via the TypeSafe Jev confidence-gated cascade
+(`evaluator/cascade.py`, `evaluator/jev_gate.py`), the `state` handed to
+Jev -- and the `JEV_VERDICT` audit entry recording its answer and which
+cascade path (Jev-only vs Jev+jury-appeal) was taken -- is built entirely
+from already-aggregated, metadata-level rule-engine confidence scores per
+candidate hypothesis, never raw tenant telemetry rows. See
+`tests/test_cascade.py::test_cascade_pipeline_never_leaks_raw_telemetry_into_jev_or_audit_payloads`.
+
 ## Mapping to production: Azure
 
 | Local analog | Azure equivalent |

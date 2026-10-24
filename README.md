@@ -316,9 +316,84 @@ production incident diversity.
 
 ## LLM-jury evaluator
 
-`evaluator/` implements a small panel of **independent, deterministic
-judges** (CI-safe, no external calls) that each look at the rule verdict +
-evidence from a different angle:
+This repo's validation gate for a ranked RCA hypothesis has two layers:
+a fast, cheap, **confidence-gated** first pass using **TypeSafe Jev**, and
+an **LLM-jury "appeals court"** that only gets invoked when Jev's
+confidence is low/ambiguous or it disagrees with the deterministic rule
+engine.
+
+```mermaid
+flowchart TB
+    HYP["RCA Hypothesis<br/>(top-ranked by the rule engine)"] --> GATE{{"Jev Confidence-Gated<br/>Decision Gate"}}
+    GATE -->|"high confidence<br/>+ agrees with rule engine"| AUTO["Auto accept<br/>(auto_remediate / alert)"]
+    GATE -->|"low/ambiguous confidence,<br/>OR disagreement with<br/>the rule engine"| JURY["LLM-Jury<br/>'appeals court'"]
+    JURY --> VERDICT["Final verdict +<br/>textual rationale"]
+    VERDICT --> AUDIT[("Audit entry<br/>(path + rationale, metadata only)")]
+    AUTO --> AUDIT
+```
+
+### TypeSafe Jev + Confidence-Gated Routing
+
+[Jev](https://typesafe.ai/) ([docs](https://docs.typesafe.ai/introduction))
+is a real, commercially-available "System One model" from TypeSafe for
+fast, cheap, *calibrated* structured decisions: instead of free-text, you
+ask it typed questions about some state and get back a typed answer with a
+documented [confidence formula](https://docs.typesafe.ai/confidence):
+
+- **Noul** (yes/no): `{"noul": p}` -- a single probability.
+- **Choice** (pick one of an unordered set): `{"choice": id, "probabilities": {...}, "confidence": c}`,
+  where `confidence = (n * p_max - 1) / (n - 1)` for `n` options.
+- **Score** (pick a point on an ordered rubric): `{"score": s, "probabilities": {...}, "confidence": c}`,
+  where `score = sum(k * p_k)` and confidence is derived from how
+  concentrated the probability mass is around its mode versus a uniform
+  baseline.
+
+`evaluator/jev_gate.py` implements this exact contract, plus
+`LocalJevStandIn`: a **deterministic, fully offline stand-in** built from
+this repo's own rule-engine confidence scores (not a trained model) that
+implements the identical contract and the identical confidence formulas,
+so `evaluator/cascade.py`'s routing logic is fully testable without any
+API key. Swapping in the real hosted model later is one line:
+`get_default_jev_client()` returns `TypeSafeJevClient` automatically once
+`TYPESAFE_API_KEY` is set (see `requirements-jev.txt` for its optional
+`httpx` dependency).
+
+`evaluator/cascade.py`'s `ConfidenceGatedCascade` asks Jev a Choice
+question ("which ranked hypothesis is best supported?") and a Score
+question ("how well-supported is the top one, on a rubric from unsupported
+to fully supported?"), then applies TypeSafe's own documented
+architectural pattern, **["Confidence-Gated Routing"](https://docs.typesafe.ai/patterns/confidence-routing)**:
+confidence is a *second* decision axis, independent of the answer itself --
+high confidence acts automatically, medium proceeds with caution, low
+falls back to a different system. Concretely:
+
+- **Jev agrees with the rule engine's top pick, at high confidence** ->
+  the fast path: Jev alone gates the decision (`auto_remediate`/`alert`
+  via the same `combine_decision` thresholds used elsewhere), the jury is
+  never invoked.
+- **Jev's confidence is low/ambiguous, or it disagrees with the rule
+  engine** -> escalate to the existing jury as an "appeals court" for a
+  nuanced, textual rationale and the final verdict.
+
+Both paths, and the reason for the routing decision, are recorded in a
+`JEV_VERDICT` audit entry (plus a `JURY_VERDICT` entry only when the jury
+was actually invoked) -- see `tests/test_cascade.py` for routing tests
+against both hand-constructed cases and all 5 labeled scenarios. Only
+metadata (candidate labels + rule-engine confidence scores) is ever placed
+in the `state` handed to Jev, never raw tenant telemetry rows.
+
+**When to use which:**
+
+| Situation | Recommended gate |
+|---|---|
+| Production self-healing monitoring, well-characterized failure signatures, latency/cost-sensitive | Jev only (confidence-gated, skip the jury when confident+agreeing) |
+| Ambiguous, high-impact, or novel failure signatures; post-incident review | Jev + jury appeals court (always escalate, or lower the confidence threshold) |
+
+### The jury panel itself
+
+`evaluator/judges.py` implements a small panel of **independent,
+deterministic judges** (CI-safe, no external calls) that each look at the
+rule verdict + evidence from a different angle:
 
 - `RuleAlignmentJudge` -- mirrors the rule engine's own verdict.
 - `EvidenceCoverageJudge` -- looks only at the fraction of signals matched.
@@ -328,22 +403,32 @@ evidence from a different angle:
 
 `JuryPanel.convene()` aggregates votes into a majority consensus, mean
 confidence, and **visible dissent notes** rather than a single smoothed
-number. `evaluator/decision.py` then combines the rule engine's
-confidence with the jury consensus:
+number. `evaluator/decision.py`'s `combine_decision()` then combines a
+rule-engine verdict with *either* the jury's consensus *or* a Jev-derived
+pseudo-consensus (same thresholds, one source of truth either way):
 
-| Rule engine | Jury | Confidence | Action |
+| Rule engine | Jury/Jev | Confidence | Action |
 |---|---|---|---|
 | matched | supports | both >= high threshold | `auto_remediate` |
 | matched | supports | moderate | `alert` |
 | disagree, or either confidence low | -- | -- | `escalate` |
 
-**Honest grounding**: a diverse panel reduces the single-point-of-failure
+**Honest grounding**: a diverse judge panel reduces the single-point-of-failure
 bias/variance of asking one judge once, and a small panel of cheap,
-deterministic heuristics is faster/cheaper than one large model call by
-construction -- this repo does not claim or fabricate any benchmark
-numbers about accuracy uplift. `evaluator/judges.py` documents an
-unimplemented `LLMJudge` extension point for plugging in a real small/local
-model; it is intentionally not wired in, to keep CI fully offline.
+deterministic heuristics -- or a single calibrated Jev call -- is
+faster/cheaper than one large model call by construction. This repo does
+not claim or fabricate any benchmark numbers about accuracy uplift; Jev's
+own speed/cost multiplier claims are TypeSafe's self-reported figures on
+their own workflows and are not independently verified here.
+`evaluator/judges.py` documents an unimplemented `LLMJudge` extension
+point for plugging in a real small/local model as an additional juror; it
+is intentionally not wired in, to keep CI fully offline.
+
+DeepEval's own Jev integration, ["Jev-as-a-judge"](https://deepeval.com/blog/introducing-jev-as-a-judge),
+combines several typed questions into one weighted score,
+`JevEval = sum(w_i * v_i) / sum(w_i)` -- cited here only as the inspiration
+for *why* combining multiple typed questions into one signal is a
+reasonable pattern; this repo does not reimplement JevEval itself.
 
 ## Audit log
 
@@ -360,13 +445,14 @@ prev_hash[i+1] = entry_hash[i]
 each `prev_hash` link; any tampered payload or reordered entry is detected
 and reported with the index where the break occurs. Every payload is
 metadata only -- alert fields, hypothesis descriptions, `QueryDescriptor`s
-(table/tenants/columns/row-count, never raw rows), rule/jury verdicts, and
-final decisions -- preserving zero-copy even inside the audit trail itself.
+(table/tenants/columns/row-count, never raw rows), rule/jury/Jev verdicts
+(including which cascade path was taken and why), and final decisions --
+preserving zero-copy even inside the audit trail itself.
 
 ## Testing
 
 ```powershell
-pytest -q                               # all 53 tests
+pytest -q                               # all 80 tests
 pytest -q --cov=. --cov-report=term-missing   # with coverage (97% at last run)
 ```
 
@@ -376,6 +462,8 @@ pytest -q --cov=. --cov-report=term-missing   # with coverage (97% at last run)
 | `tests/test_federation.py` | Cross-tenant federated query correctness, structural out-of-scope refusal, column redaction, metadata-only `QueryDescriptor` shape |
 | `tests/test_rules.py` | Per-scenario top-verdict correctness + precision/recall across the labeled scenario catalog |
 | `tests/test_jury.py` | Consensus/dissent aggregation, rule+jury decision-combination policy (auto_remediate/alert/escalate) |
+| `tests/test_jev_gate.py` | Jev confidence formulas against the documented spec (Choice, Score, boundary cases), `LocalJevStandIn` determinism and behavior |
+| `tests/test_cascade.py` | Cascade routing (high-confidence+agreement -> Jev-only; low-confidence or disagreement -> jury), the candidate-label-collision regression, full pipeline across all 5 scenarios, audit-trail path recording |
 | `tests/test_audit.py` | Hash-chain integrity, tamper detection (payload edit + reordering), JSONL export |
 | `tests/test_e2e.py` | Full pipeline per scenario: correct root cause, complete/intact audit trail, no raw telemetry text leaking into audit payloads, end-to-end tamper detection |
 
@@ -421,6 +509,15 @@ Everything runs fully offline with no external API keys.
 - **Jury judges are deterministic stubs.** No real LLM call is wired in by
   default (by design, for offline CI); `evaluator/judges.py` documents how
   to add one.
+- **TypeSafe Jev's real hosted model was not exercised.** `TYPESAFE_API_KEY`
+  was not available in this build environment, so only `LocalJevStandIn`
+  (the deterministic, offline, contract-compatible stand-in) was run and
+  tested. `TypeSafeJevClient` is implemented against the documented REST
+  API (verified against docs.typesafe.ai at the time of writing) but its
+  network path is unexercised; switching to the real model is a one-line
+  change (`get_default_jev_client()`) once an API key is available.
+  TypeSafe's own speed/cost multiplier claims are self-reported on their
+  own workflows and are repeated here only with that explicit caveat.
 
 ## Repository layout
 
@@ -429,15 +526,17 @@ otel_mock/      synthetic OTel-like log/trace/metric generator + labeled failure
 federation/     zero-copy, multi-tenant federated query layer (the centerpiece)
 agent/          agentic RCA loop: triage, hypothesize, gather evidence, rank
 rules/          deterministic YAML rule DSL + evaluation engine
-evaluator/      LLM-jury panel + rule/jury decision combination
+evaluator/      TypeSafe Jev confidence-gated cascade + LLM-jury panel + decision combination
 audit/          hash-chained, append-only audit log
 common/         shared, generic call-graph helpers
-tests/          pytest suite (53 tests, fully offline)
+tests/          pytest suite (80 tests, fully offline)
 scripts/        demo.py -- CLI entry point for the end-to-end demo
 deployment/     Azure (Bicep) + GCP (Terraform) illustrative IaC templates
 docs/           ZERO_COPY_DATA_MODEL.md, AZURE_DEPLOYMENT.md, GCP_DEPLOYMENT.md
 .github/workflows/ci.yml   lint (ruff) + pytest on every push/PR
 Dockerfile, docker-compose.yml   local demo container
+requirements.txt            core, offline-safe dependencies
+requirements-jev.txt        optional deps for the real TypeSafe Jev adapter (httpx, typesafe-sdk)
 ```
 
 ## License
