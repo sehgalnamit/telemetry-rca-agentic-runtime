@@ -25,9 +25,12 @@ rules:
     description: >
       Candidate service's memory metric trends sharply upward within the
       incident window (second half well above first half) and well above
-      its own baseline average, accompanied by GC/OOM-style log lines.
+      its own baseline average. GC/OOM-style log lines corroborate the
+      finding when present, but by the time an alert fires the leak may not
+      yet have produced one -- so the metric-trend signals alone, at full
+      strength, are sufficient to fire this rule at reduced confidence.
     confidence: 0.85
-    min_match_ratio: 1.0
+    min_match_ratio: 0.6
     signals:
       - type: metric_trend_ratio_gte
         target: primary
@@ -40,6 +43,7 @@ rules:
       - type: log_pattern
         target: primary
         pattern: "OutOfMemoryError|GC pause exceeded threshold"
+        required: false
 
   - id: bad_deploy_v1
     root_cause_type: bad_deploy
