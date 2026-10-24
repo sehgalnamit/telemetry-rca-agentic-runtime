@@ -1,0 +1,31 @@
+# Example tfvars for deployment/gcp.
+#
+# ILLUSTRATIVE TEMPLATE -- NOT APPLIED TO ANY LIVE GCP PROJECT. See the
+# disclaimer at the top of versions.tf and docs/GCP_DEPLOYMENT.md. Copy
+# this file to terraform.tfvars (or pass -var-file=terraform.tfvars.example)
+# and replace project_id with a real project before ever running
+# `terraform plan` for a real deployment.
+
+project_id       = "your-rca-operator-project-id"
+region           = "us-central1"
+environment_name = "rca-dev"
+
+container_image  = "us-docker.pkg.dev/cloudrun/container/hello"
+container_cpu    = "1"
+container_memory = "512Mi"
+min_instances    = 0
+max_instances    = 2
+
+labels = {
+  project           = "telemetry-rca-agentic-runtime"
+  component         = "rca-control-plane"
+  deployment-status = "illustrative-template-only"
+}
+
+# Left empty: see the comments on these variables in variables.tf. Only
+# fill these in if you are modeling the DATA-PLANE delegation pattern
+# against a real tenant project you control, understanding that applying
+# it requires the tenant project's own Terraform/gcloud session, not this
+# one's.
+tenant_project_id = ""
+tenant_dataset_id = ""

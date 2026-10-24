@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": {
+      "value": "rca-dev"
+    },
+    "location": {
+      "value": "eastus2"
+    },
+    "containerImage": {
+      "value": "mcr.microsoft.com/k8se/quickstart:latest"
+    },
+    "logAnalyticsRetentionDays": {
+      "value": 30
+    },
+    "containerRegistrySku": {
+      "value": "Basic"
+    },
+    "deploymentPrincipalId": {
+      "value": ""
+    },
+    "tags": {
+      "value": {
+        "project": "telemetry-rca-agentic-runtime",
+        "component": "rca-control-plane",
+        "deploymentStatus": "illustrative-template-only"
+      }
+    }
+  }
+}
