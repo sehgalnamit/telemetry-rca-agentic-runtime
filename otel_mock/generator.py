@@ -6,6 +6,18 @@ inject one labeled :class:`~otel_mock.scenarios.FailureScenario` into a
 sub-window of the generated time range. Everything is seeded so that the
 same ``(topology, seed, scenario)`` always reproduces byte-identical output,
 which is required for the pipeline-scoring tests.
+
+Per-timestamp telemetry is built as a *request tree*: for every top-level
+service, a synthetic request recursively fans out into that service's
+declared dependencies, producing a connected set of spans (and, on error,
+logs) that share a single ``trace_id``. Failure-scenario modifiers (error
+probability boost, latency multiplier, forced errors, extra log lines) are
+always expressed as **per-service dictionaries** keyed by service name and
+looked up using the service actually being emitted at each recursion level
+-- never inherited as a value from whichever top-level service started the
+recursion. This avoids diluting a scenario's signal when the affected
+service is reached indirectly (e.g. service A's request tree calling into
+the root-cause service two hops down).
 """
 
 from __future__ import annotations
@@ -84,18 +96,7 @@ class TelemetryGenerator:
         t = start
         while t < end:
             for service in self.topology.services:
-                trace_id = uuid.uuid5(
-                    uuid.NAMESPACE_URL, f"{self.topology.tenant_id}:{service}:{t.isoformat()}"
-                ).hex
-                self._emit_request_tree(
-                    service=service,
-                    trace_id=trace_id,
-                    timestamp=t,
-                    logs=logs,
-                    traces=traces,
-                    error_boost=0.0,
-                    latency_multiplier=1.0,
-                )
+                self._emit_request_tree_for_entry(service, t, logs, traces)
                 metrics.extend(self._baseline_metrics_for(service, t))
             t += timedelta(seconds=interval_s)
         return logs, traces, metrics
@@ -104,7 +105,10 @@ class TelemetryGenerator:
         tenant = self.topology.tenant_id
         base_cpu = 20.0 + 30.0 * _stable_unit_interval(service + "cpu")
         base_mem = 128.0 + 256.0 * _stable_unit_interval(service + "mem")
-        jitter = lambda scale: self._rng.uniform(-scale, scale)  # noqa: E731
+
+        def jitter(scale: float) -> float:
+            return self._rng.uniform(-scale, scale)
+
         return [
             MetricPoint(
                 tenant_id=tenant,
@@ -140,22 +144,55 @@ class TelemetryGenerator:
             ),
         ]
 
-    def _emit_request_tree(
+    def _emit_request_tree_for_entry(
+        self,
+        entry_service: str,
+        timestamp: datetime,
+        logs: list[LogRecord],
+        traces: list[TraceSpan],
+        error_boost_by_service: Optional[dict[str, float]] = None,
+        latency_multiplier_by_service: Optional[dict[str, float]] = None,
+        force_error_services: Optional[set[str]] = None,
+        extra_log_by_service: Optional[dict[str, tuple[Severity, str]]] = None,
+        extra_attributes_by_service: Optional[dict[str, dict]] = None,
+    ) -> None:
+        trace_id = uuid.uuid5(
+            uuid.NAMESPACE_URL, f"{self.topology.tenant_id}:{entry_service}:{timestamp.isoformat()}"
+        ).hex
+        self._emit_span(
+            service=entry_service,
+            trace_id=trace_id,
+            timestamp=timestamp,
+            logs=logs,
+            traces=traces,
+            error_boost_by_service=error_boost_by_service or {},
+            latency_multiplier_by_service=latency_multiplier_by_service or {},
+            parent_span_id=None,
+            force_error_services=force_error_services,
+            extra_log_by_service=extra_log_by_service,
+            extra_attributes_by_service=extra_attributes_by_service or {},
+        )
+
+    def _emit_span(
         self,
         service: str,
         trace_id: str,
         timestamp: datetime,
         logs: list[LogRecord],
         traces: list[TraceSpan],
-        error_boost: float,
-        latency_multiplier: float,
-        parent_span_id: Optional[str] = None,
-        extra_attributes: Optional[dict] = None,
-        force_error_services: Optional[set[str]] = None,
-        extra_log_by_service: Optional[dict[str, tuple[Severity, str]]] = None,
+        error_boost_by_service: dict[str, float],
+        latency_multiplier_by_service: dict[str, float],
+        parent_span_id: Optional[str],
+        force_error_services: Optional[set[str]],
+        extra_log_by_service: Optional[dict[str, tuple[Severity, str]]],
+        extra_attributes_by_service: dict[str, dict],
     ) -> None:
-        """Recursively emit a span (and its downstream dependency spans)."""
+        """Emit exactly one span for ``service`` (and recurse into its own
+        declared dependencies), with every modifier looked up by the
+        *current* service name so nothing is diluted by recursion depth."""
         span_id = uuid.uuid4().hex[:16]
+        latency_multiplier = latency_multiplier_by_service.get(service, 1.0)
+        error_boost = error_boost_by_service.get(service, 0.0)
         base_latency = _baseline_latency_ms(service) * latency_multiplier
         duration = max(1.0, self._rng.gauss(base_latency, base_latency * 0.1))
 
@@ -163,7 +200,7 @@ class TelemetryGenerator:
         is_error = forced_error or (self._rng.random() < (0.01 + error_boost))
         status = SpanStatus.ERROR if is_error else SpanStatus.OK
 
-        attributes = dict(extra_attributes or {})
+        attributes = dict(extra_attributes_by_service.get(service, {}))
         traces.append(
             TraceSpan(
                 tenant_id=self.topology.tenant_id,
@@ -206,18 +243,25 @@ class TelemetryGenerator:
             )
 
         for dep in self.topology.downstream_of(service):
-            self._emit_request_tree(
+            if dep not in self.topology.services:
+                # External dependency (not one of this tenant's own
+                # instrumented services): we deliberately emit no telemetry
+                # for it -- only the caller's own span/log reflects the
+                # failed call. This matches the downstream-outage scenario
+                # description ("the dependency itself emits no telemetry").
+                continue
+            self._emit_span(
                 service=dep,
                 trace_id=trace_id,
                 timestamp=timestamp + timedelta(milliseconds=duration * 0.1),
                 logs=logs,
                 traces=traces,
-                error_boost=error_boost,
-                latency_multiplier=latency_multiplier,
+                error_boost_by_service=error_boost_by_service,
+                latency_multiplier_by_service=latency_multiplier_by_service,
                 parent_span_id=span_id,
-                extra_attributes=extra_attributes,
                 force_error_services=force_error_services,
                 extra_log_by_service=extra_log_by_service,
+                extra_attributes_by_service=extra_attributes_by_service,
             )
 
     # ------------------------------------------------------------------
@@ -265,6 +309,19 @@ class TelemetryGenerator:
                 return svc
         return self.topology.services[-1]
 
+    def _scaled_baseline_metrics(
+        self, service: str, t: datetime, latency_mult: float, error_boost: float
+    ) -> list[MetricPoint]:
+        points = self._baseline_metrics_for(service, t)
+        scaled = []
+        for p in points:
+            if p.metric_name == "request_latency_ms_p99":
+                p = p.model_copy(update={"value": p.value * latency_mult})
+            elif p.metric_name == "error_rate":
+                p = p.model_copy(update={"value": min(1.0, p.value + error_boost)})
+            scaled.append(p)
+        return scaled
+
     def _inject_cascading_timeout(
         self, start, end, interval_s, window_start, window_end, root_cause_service, **_
     ):
@@ -279,30 +336,26 @@ class TelemetryGenerator:
         t = start
         while t < end:
             in_window = window_start <= t <= window_end
-            for service in self.topology.services:
-                trace_id = uuid.uuid5(
-                    uuid.NAMESPACE_URL, f"{self.topology.tenant_id}:{service}:{t.isoformat()}"
-                ).hex
-                lat_mult = 20.0 if (in_window and service == root) else 1.0
-                force_error = upstream if in_window else None
-                extra_log = None
-                if in_window and service == root:
-                    extra_log = {root: (Severity.WARN, f"{root} latency degraded sharply")}
-                elif in_window and service in upstream:
-                    extra_log = {
-                        service: (
-                            Severity.ERROR,
-                            f"timeout waiting on downstream dependency {root}",
-                        )
+            lat_by_service = {root: 20.0} if in_window else {}
+            force_error = set(upstream) if in_window else None
+            extra_log = None
+            if in_window:
+                extra_log = {root: (Severity.WARN, f"{root} latency degraded sharply")}
+                extra_log.update(
+                    {
+                        s: (Severity.ERROR, f"timeout waiting on downstream dependency {root}")
+                        for s in upstream
                     }
-                self._emit_request_tree(
-                    service=service,
-                    trace_id=trace_id,
-                    timestamp=t,
-                    logs=logs,
-                    traces=traces,
-                    error_boost=0.0,
-                    latency_multiplier=lat_mult,
+                )
+
+            for service in self.topology.services:
+                self._emit_request_tree_for_entry(
+                    service,
+                    t,
+                    logs,
+                    traces,
+                    error_boost_by_service={},
+                    latency_multiplier_by_service=lat_by_service,
                     force_error_services=force_error,
                     extra_log_by_service=extra_log,
                 )
@@ -324,19 +377,6 @@ class TelemetryGenerator:
         )
         return logs, traces, metrics, truth
 
-    def _scaled_baseline_metrics(
-        self, service: str, t: datetime, latency_mult: float, error_boost: float
-    ) -> list[MetricPoint]:
-        points = self._baseline_metrics_for(service, t)
-        scaled = []
-        for p in points:
-            if p.metric_name == "request_latency_ms_p99":
-                p = p.model_copy(update={"value": p.value * latency_mult})
-            elif p.metric_name == "error_rate":
-                p = p.model_copy(update={"value": min(1.0, p.value + error_boost)})
-            scaled.append(p)
-        return scaled
-
     def _inject_memory_leak(
         self, start, end, interval_s, window_start, window_end, root_cause_service, **_
     ):
@@ -352,25 +392,24 @@ class TelemetryGenerator:
             in_window = window_start <= t <= window_end
             progress = ((t - window_start).total_seconds() / total) if in_window else 0.0
             progress = min(max(progress, 0.0), 1.0)
-            late_phase = progress > 0.8
+            late_phase = in_window and progress > 0.8
+
+            lat_by_service = {root: 1.0 + progress * 4.0} if late_phase else {}
+            err_by_service = {root: 0.3} if late_phase else {}
+            extra_log = (
+                {root: (Severity.ERROR, "GC pause exceeded threshold / OutOfMemoryError risk")}
+                if late_phase
+                else None
+            )
 
             for service in self.topology.services:
-                trace_id = uuid.uuid5(
-                    uuid.NAMESPACE_URL, f"{self.topology.tenant_id}:{service}:{t.isoformat()}"
-                ).hex
-                lat_mult = 1.0 + (progress * 4.0 if (service == root and late_phase) else 0.0)
-                err_boost = 0.3 if (service == root and late_phase) else 0.0
-                extra_log = None
-                if service == root and late_phase:
-                    extra_log = {root: (Severity.ERROR, "GC pause exceeded threshold / OutOfMemoryError risk")}
-                self._emit_request_tree(
-                    service=service,
-                    trace_id=trace_id,
-                    timestamp=t,
-                    logs=logs,
-                    traces=traces,
-                    error_boost=err_boost,
-                    latency_multiplier=lat_mult,
+                self._emit_request_tree_for_entry(
+                    service,
+                    t,
+                    logs,
+                    traces,
+                    error_boost_by_service=err_by_service,
+                    latency_multiplier_by_service=lat_by_service,
                     extra_log_by_service=extra_log,
                 )
                 base_mem = 128.0 + 256.0 * _stable_unit_interval(service + "mem")
@@ -388,12 +427,14 @@ class TelemetryGenerator:
                         unit="MB",
                     )
                 )
+                lat_mult = lat_by_service.get(service, 1.0)
+                err_boost = err_by_service.get(service, 0.0)
                 for p in self._baseline_metrics_for(service, t):
                     if p.metric_name == "memory_rss_mb":
                         continue
-                    if p.metric_name == "request_latency_ms_p99" and service == root:
+                    if p.metric_name == "request_latency_ms_p99":
                         p = p.model_copy(update={"value": p.value * lat_mult})
-                    if p.metric_name == "error_rate" and service == root:
+                    if p.metric_name == "error_rate":
                         p = p.model_copy(update={"value": min(1.0, p.value + err_boost)})
                     metrics.append(p)
             t += timedelta(seconds=interval_s)
@@ -426,30 +467,27 @@ class TelemetryGenerator:
         while t < end:
             after_flip = t >= flip_time
             version = "v1.2.4-bad" if after_flip else "v1.2.3"
+            err_by_service: dict[str, float] = {}
+            if after_flip:
+                err_by_service[root] = 0.5
+                for c in callers:
+                    err_by_service[c] = 0.15
+            attrs_by_service = {root: {"deploy_version": version}}
+            extra_log = None
+            if after_flip and t == flip_time:
+                extra_log = {root: (Severity.WARN, f"deploy_version changed to {version}")}
+
             for service in self.topology.services:
-                trace_id = uuid.uuid5(
-                    uuid.NAMESPACE_URL, f"{self.topology.tenant_id}:{service}:{t.isoformat()}"
-                ).hex
-                attrs = {"deploy_version": version} if service == root else None
-                err_boost = 0.0
-                if service == root and after_flip:
-                    err_boost = 0.5
-                elif service in callers and after_flip:
-                    err_boost = 0.15
-                extra_log = None
-                if service == root and after_flip and t == flip_time:
-                    extra_log = {root: (Severity.WARN, f"deploy_version changed to {version}")}
-                self._emit_request_tree(
-                    service=service,
-                    trace_id=trace_id,
-                    timestamp=t,
-                    logs=logs,
-                    traces=traces,
-                    error_boost=err_boost,
-                    latency_multiplier=1.0,
-                    extra_attributes=attrs,
+                self._emit_request_tree_for_entry(
+                    service,
+                    t,
+                    logs,
+                    traces,
+                    error_boost_by_service=err_by_service,
+                    extra_attributes_by_service=attrs_by_service,
                     extra_log_by_service=extra_log,
                 )
+                err_boost = err_by_service.get(service, 0.0)
                 for p in self._baseline_metrics_for(service, t):
                     if p.metric_name == "error_rate" and err_boost:
                         p = p.model_copy(update={"value": min(1.0, p.value + err_boost)})
@@ -474,9 +512,7 @@ class TelemetryGenerator:
     ):
         dependency = external_dependency or "external-payment-gateway"
         callers = {
-            svc
-            for svc, deps in self.topology.dependencies.items()
-            if dependency in deps
+            svc for svc, deps in self.topology.dependencies.items() if dependency in deps
         }
         if not callers:
             # No service explicitly depends on it in the topology; attach it
@@ -490,30 +526,28 @@ class TelemetryGenerator:
         t = start
         while t < end:
             in_window = window_start <= t <= window_end
+            err_by_service = {c: 0.9 for c in callers} if in_window else {}
+            attrs_by_service = {c: {"dependency": dependency} for c in callers} if in_window else {}
+            extra_log = (
+                {
+                    c: (Severity.ERROR, f"connection refused calling dependency {dependency}")
+                    for c in callers
+                }
+                if in_window
+                else None
+            )
+
             for service in self.topology.services:
-                trace_id = uuid.uuid5(
-                    uuid.NAMESPACE_URL, f"{self.topology.tenant_id}:{service}:{t.isoformat()}"
-                ).hex
-                err_boost = 0.9 if (in_window and service in callers) else 0.0
-                extra_log = None
-                if in_window and service in callers:
-                    extra_log = {
-                        service: (
-                            Severity.ERROR,
-                            f"connection refused calling dependency {dependency}",
-                        )
-                    }
-                self._emit_request_tree(
-                    service=service,
-                    trace_id=trace_id,
-                    timestamp=t,
-                    logs=logs,
-                    traces=traces,
-                    error_boost=err_boost,
-                    latency_multiplier=1.0,
-                    extra_attributes={"dependency": dependency} if service in callers else None,
+                self._emit_request_tree_for_entry(
+                    service,
+                    t,
+                    logs,
+                    traces,
+                    error_boost_by_service=err_by_service,
+                    extra_attributes_by_service=attrs_by_service,
                     extra_log_by_service=extra_log,
                 )
+                err_boost = err_by_service.get(service, 0.0)
                 for p in self._baseline_metrics_for(service, t):
                     if p.metric_name == "error_rate" and err_boost:
                         p = p.model_copy(update={"value": min(1.0, p.value + err_boost)})
@@ -533,13 +567,39 @@ class TelemetryGenerator:
         )
         return logs, traces, metrics, truth
 
+    def _default_noisy_neighbor_pair(self) -> tuple[str, str]:
+        """Pick two services that share infrastructure (same ``node``) but
+        have no direct call-dependency edge between them -- i.e. a genuine
+        "noisy neighbor" pair, not two services that are merely slow because
+        one legitimately calls the other."""
+        by_node: dict[str, list[str]] = {}
+        for svc in self.topology.services:
+            node = self.topology.nodes.get(svc, f"node-{svc}")
+            by_node.setdefault(node, []).append(svc)
+        for _node, svcs in sorted(by_node.items()):
+            for a in svcs:
+                for b in svcs:
+                    if a == b:
+                        continue
+                    if b in self.topology.dependencies.get(a, []):
+                        continue
+                    if a in self.topology.dependencies.get(b, []):
+                        continue
+                    return a, b
+        # No same-node, unrelated pair exists in this topology; fall back to
+        # the first two declared services (scenario will still run, just
+        # without the "shared infra, no logical dependency" nuance).
+        if len(self.topology.services) > 1:
+            return self.topology.services[0], self.topology.services[1]
+        return self.topology.services[0], self.topology.services[0]
+
     def _inject_noisy_neighbor(
         self, start, end, interval_s, window_start, window_end, noisy_service, victim_service, **_
     ):
-        noisy = noisy_service or self.topology.services[0]
-        victim = victim_service or (
-            self.topology.services[1] if len(self.topology.services) > 1 else self.topology.services[0]
-        )
+        if noisy_service and victim_service:
+            noisy, victim = noisy_service, victim_service
+        else:
+            noisy, victim = self._default_noisy_neighbor_pair()
         shared_node = self.topology.nodes.get(noisy, f"node-{noisy}")
 
         logs: list[LogRecord] = []
@@ -549,33 +609,28 @@ class TelemetryGenerator:
         t = start
         while t < end:
             in_window = window_start <= t <= window_end
+            lat_by_service = {victim: 3.0} if in_window else {}
+            err_by_service = {victim: 0.1} if in_window else {}
+            extra_log = (
+                {victim: (Severity.WARN, f"degraded performance on shared node {shared_node}")}
+                if in_window
+                else None
+            )
+            attrs_by_service = {
+                svc: {"node": self.topology.nodes.get(svc, f"node-{svc}")}
+                for svc in self.topology.services
+            }
+
             for service in self.topology.services:
-                trace_id = uuid.uuid5(
-                    uuid.NAMESPACE_URL, f"{self.topology.tenant_id}:{service}:{t.isoformat()}"
-                ).hex
-                lat_mult = 1.0
-                err_boost = 0.0
-                if in_window and service == victim:
-                    lat_mult = 3.0
-                    err_boost = 0.1
-                extra_log = None
-                if in_window and service == victim:
-                    extra_log = {
-                        victim: (
-                            Severity.WARN,
-                            f"degraded performance on shared node {shared_node}",
-                        )
-                    }
-                self._emit_request_tree(
-                    service=service,
-                    trace_id=trace_id,
-                    timestamp=t,
-                    logs=logs,
-                    traces=traces,
-                    error_boost=err_boost,
-                    latency_multiplier=lat_mult,
-                    extra_attributes={"node": self.topology.nodes.get(service, f"node-{service}")},
+                self._emit_request_tree_for_entry(
+                    service,
+                    t,
+                    logs,
+                    traces,
+                    error_boost_by_service=err_by_service,
+                    latency_multiplier_by_service=lat_by_service,
                     extra_log_by_service=extra_log,
+                    extra_attributes_by_service=attrs_by_service,
                 )
                 for p in self._baseline_metrics_for(service, t):
                     metrics.append(p)
@@ -592,6 +647,7 @@ class TelemetryGenerator:
                         )
                     )
                 if in_window and service == victim:
+                    lat_mult = lat_by_service.get(victim, 1.0)
                     metrics.append(
                         MetricPoint(
                             tenant_id=self.topology.tenant_id,

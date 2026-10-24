@@ -1,0 +1,97 @@
+rules:
+  - id: cascading_timeout_v1
+    root_cause_type: cascading_timeout
+    description: >
+      Candidate service shows a sharp latency blow-up relative to its own
+      recent baseline, and at least one other service in the evidence set
+      logs an explicit timeout waiting on that candidate, with elevated
+      error rate during the incident window.
+    confidence: 0.9
+    min_match_ratio: 1.0
+    signals:
+      - type: latency_ratio_gte
+        target: primary
+        gte: 5.0
+      - type: log_pattern
+        target: other
+        pattern: "timeout waiting on downstream dependency"
+        severity: ERROR
+      - type: error_rate_incident_gte
+        target: other
+        gte: 0.2
+
+  - id: memory_leak_v1
+    root_cause_type: memory_leak
+    description: >
+      Candidate service's memory metric trends sharply upward within the
+      incident window (second half well above first half) and well above
+      its own baseline average, accompanied by GC/OOM-style log lines.
+    confidence: 0.85
+    min_match_ratio: 1.0
+    signals:
+      - type: metric_trend_ratio_gte
+        target: primary
+        metric_name: memory_rss_mb
+        gte: 2.0
+      - type: metric_increasing
+        target: primary
+        metric_name: memory_rss_mb
+        factor_gte: 1.3
+      - type: log_pattern
+        target: primary
+        pattern: "OutOfMemoryError|GC pause exceeded threshold"
+
+  - id: bad_deploy_v1
+    root_cause_type: bad_deploy
+    description: >
+      Candidate service's deploy_version (or equivalent config) attribute
+      changed between the baseline and incident window, coinciding with a
+      material jump in that service's own error rate.
+    confidence: 0.85
+    min_match_ratio: 1.0
+    signals:
+      - type: attribute_changed
+        target: primary
+        attribute: deploy_version
+      - type: error_rate_delta_gte
+        target: primary
+        gte: 0.2
+      - type: error_rate_incident_gte
+        target: other
+        gte: 0.05
+        required: false
+
+  - id: downstream_dependency_outage_v1
+    root_cause_type: downstream_dependency_outage
+    description: >
+      One or more services log connection-refused/timeout errors naming an
+      external dependency, with a sharp error-rate jump during the incident
+      window, while that dependency itself is never a service we hold
+      telemetry for (it lives outside the tenant's own instrumented stack).
+    confidence: 0.85
+    min_match_ratio: 1.0
+    signals:
+      - type: log_pattern
+        target: other
+        pattern: "connection refused calling dependency"
+        severity: ERROR
+      - type: error_rate_incident_gte
+        target: other
+        gte: 0.4
+
+  - id: noisy_neighbor_v1
+    root_cause_type: noisy_neighbor
+    description: >
+      Candidate service saturates a shared-infrastructure resource (CPU)
+      during the incident window, and a functionally-unrelated peer service
+      sharing the same node shows correlated latency degradation despite no
+      logical call dependency between the two.
+    confidence: 0.75
+    min_match_ratio: 1.0
+    signals:
+      - type: metric_incident_max_gte
+        target: primary
+        metric_name: cpu_utilization_pct
+        gte: 90.0
+      - type: peer_shared_node_degraded
+        gte: 1.8
