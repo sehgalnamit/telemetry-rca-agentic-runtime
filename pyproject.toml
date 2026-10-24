@@ -1,0 +1,12 @@
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = ["data", "deployment", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
