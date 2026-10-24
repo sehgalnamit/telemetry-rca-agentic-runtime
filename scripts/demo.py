@@ -113,10 +113,6 @@ def run_demo(scenario_key: str, tenant_id: str = "acme", seed: int = 11) -> bool
     return correct
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=list(SCENARIOS), help="run a single scenario")
-    parser.add_argument("--all", action="store_true", help="run every scenario in the catalog")
 def run_cross_tenant_federation_demo(seed: int = 11) -> None:
     """Demonstrates the zero-copy federation layer in isolation: each
     tenant's telemetry lives in its own DuckDB file, a scoped query reads
