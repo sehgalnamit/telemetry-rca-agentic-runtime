@@ -13,8 +13,12 @@ Loop (per alert):
                    objects.
   (d) rank hypotheses -- run the deterministic rule engine over each
                    bundle and rank by resulting confidence.
-  (e) jury gate   -- convene the jury on the top-ranked hypothesis.
-  (f) decide      -- combine rule + jury into a final action.
+  (e) validation gate -- either the jury alone (``investigate()``) or the
+                   TypeSafe Jev confidence-gated cascade, which only falls
+                   back to the jury "appeals court" when Jev's confidence
+                   is low/ambiguous or it disagrees with the rule engine
+                   (``investigate_with_cascade()``).
+  (f) decide      -- combine rule + validation-gate output into a final action.
   (g) audit       -- every step above is appended to the hash-chained log.
 """
 
@@ -27,6 +31,7 @@ from agent.hypothesis import generate_hypotheses
 from agent.models import Alert, Hypothesis
 from audit.log_store import AuditLogStore
 from audit.models import AuditEntryType
+from evaluator.cascade import CascadeResult, ConfidenceGatedCascade
 from evaluator.decision import combine_decision
 from evaluator.jury import JuryPanel
 from evaluator.models import FinalDecision, JuryVerdict
@@ -55,6 +60,15 @@ class PipelineResult:
     audit_log: AuditLogStore
 
 
+@dataclass
+class CascadePipelineResult:
+    alert: Alert
+    assessments: list[HypothesisAssessment]
+    top_assessment: HypothesisAssessment
+    cascade_result: CascadeResult
+    audit_log: AuditLogStore
+
+
 class RCAAgentRuntime:
     def __init__(
         self,
@@ -76,7 +90,11 @@ class RCAAgentRuntime:
         self.baseline_duration = baseline_duration
         self.baseline_gap = baseline_gap
 
-    def investigate(self, alert: Alert, scope: AccessScope) -> PipelineResult:
+    def _triage_and_rank(self, alert: Alert, scope: AccessScope) -> list[HypothesisAssessment]:
+        """Steps (a)-(d): triage, hypothesize, gather evidence, rank.
+        Appends ALERT_RECEIVED, HYPOTHESIS, EVIDENCE_QUERY, and
+        RULE_VERDICT audit entries. Shared by ``investigate()`` (jury-only)
+        and ``investigate_with_cascade()`` (Jev confidence-gated cascade)."""
         topology = self.topology_catalog[alert.tenant_id]
 
         # (a) triage
@@ -157,6 +175,10 @@ class RCAAgentRuntime:
             assessments.append(HypothesisAssessment(hypothesis=h, rule_verdict=verdict, bundle=bundle))
 
         assessments.sort(key=lambda a: a.rule_verdict.confidence, reverse=True)
+        return assessments
+
+    def investigate(self, alert: Alert, scope: AccessScope) -> PipelineResult:
+        assessments = self._triage_and_rank(alert, scope)
         top = assessments[0]
 
         # (e) jury gate on the top-ranked hypothesis
@@ -186,5 +208,60 @@ class RCAAgentRuntime:
             top_assessment=top,
             jury_verdict=jury_verdict,
             final_decision=final_decision,
+            audit_log=self.audit_log,
+        )
+
+    def investigate_with_cascade(
+        self, alert: Alert, scope: AccessScope, cascade: ConfidenceGatedCascade
+    ) -> CascadePipelineResult:
+        """Same steps (a)-(d) as :meth:`investigate`, but validates the top
+        hypothesis via TypeSafe Jev's confidence-gated routing instead of
+        always convening the jury -- see ``evaluator.cascade`` for the
+        full cascade logic. Which path was taken (Jev-only vs
+        Jev+jury-appeal) is recorded in the ``JEV_VERDICT`` audit entry's
+        payload, alongside a ``JURY_VERDICT`` entry only when the jury was
+        actually invoked."""
+        assessments = self._triage_and_rank(alert, scope)
+        top = assessments[0]
+
+        cascade_result = cascade.evaluate(assessments)
+
+        self.audit_log.append(
+            AuditEntryType.JEV_VERDICT,
+            tenant_id=alert.tenant_id,
+            payload={
+                "hypothesis_id": top.hypothesis.hypothesis_id,
+                "path": cascade_result.path.value,
+                "jev_agrees_with_rule_engine": cascade_result.jev_agrees_with_rule_engine,
+                "jev_high_confidence": cascade_result.jev_high_confidence,
+                "choice_answer": cascade_result.jev_choice_answer.model_dump(),
+                "score_answer": cascade_result.jev_score_answer.model_dump(),
+                "rationale": cascade_result.rationale,
+            },
+        )
+        if cascade_result.jury_verdict is not None:
+            self.audit_log.append(
+                AuditEntryType.JURY_VERDICT,
+                tenant_id=alert.tenant_id,
+                payload={
+                    "hypothesis_id": top.hypothesis.hypothesis_id,
+                    **cascade_result.jury_verdict.model_dump(),
+                },
+            )
+        self.audit_log.append(
+            AuditEntryType.FINAL_DECISION,
+            tenant_id=alert.tenant_id,
+            payload={
+                "hypothesis_id": top.hypothesis.hypothesis_id,
+                "path": cascade_result.path.value,
+                **cascade_result.final_decision.model_dump(),
+            },
+        )
+
+        return CascadePipelineResult(
+            alert=alert,
+            assessments=assessments,
+            top_assessment=top,
+            cascade_result=cascade_result,
             audit_log=self.audit_log,
         )

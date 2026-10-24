@@ -5,7 +5,7 @@ evaluator, and audit log by ``agent.runtime.RCAAgentRuntime``.
 
 from agent.hypothesis import generate_hypotheses
 from agent.models import Alert, Hypothesis
-from agent.runtime import HypothesisAssessment, PipelineResult, RCAAgentRuntime
+from agent.runtime import CascadePipelineResult, HypothesisAssessment, PipelineResult, RCAAgentRuntime
 
 __all__ = [
     "generate_hypotheses",
@@ -13,5 +13,6 @@ __all__ = [
     "Hypothesis",
     "HypothesisAssessment",
     "PipelineResult",
+    "CascadePipelineResult",
     "RCAAgentRuntime",
 ]

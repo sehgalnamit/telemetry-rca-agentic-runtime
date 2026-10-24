@@ -14,6 +14,7 @@ class AuditEntryType(str, Enum):
     HYPOTHESIS = "hypothesis"
     EVIDENCE_QUERY = "evidence_query"
     RULE_VERDICT = "rule_verdict"
+    JEV_VERDICT = "jev_verdict"
     JURY_VERDICT = "jury_verdict"
     FINAL_DECISION = "final_decision"
 
